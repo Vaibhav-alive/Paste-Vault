@@ -92,6 +92,24 @@ export async function deleteDocumentRecord(id) {
   }
 }
 
+// Deletes the document and all of its versions in ONE transaction:
+// either both are removed or neither is.
+export async function deleteDocumentWithRevisions(id) {
+  try {
+    const db = await initDocumentsDb()
+    const tx = db.transaction([STORE_NAME, REVISIONS_STORE], 'readwrite')
+    const revisionStore = tx.objectStore(REVISIONS_STORE)
+    const keys = await revisionStore.index('documentId').getAllKeys(id)
+    await Promise.all([
+      ...keys.map((key) => revisionStore.delete(key)),
+      tx.objectStore(STORE_NAME).delete(id),
+      tx.done,
+    ])
+  } catch (error) {
+    throw wrapError(error, 'Could not delete the document.')
+  }
+}
+
 /* ---------- Version history ---------- */
 
 // Newest first.

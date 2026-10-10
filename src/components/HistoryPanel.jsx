@@ -26,7 +26,7 @@ export function HistoryPanel({
   onClose,
 }) {
   const [label, setLabel] = useState('')
-  const [notice, setNotice] = useState('')
+  const [notice, setNotice] = useState(null)
   const [pickedId, setPickedId] = useState(null)
   const [view, setView] = useState('changes')
 
@@ -41,21 +41,41 @@ export function HistoryPanel({
 
   async function handleSave(event) {
     event.preventDefault()
-    const created = await onSaveVersion(label)
-    setNotice(created ? 'Version saved.' : 'No changes since the last version.')
+    const result = await onSaveVersion(label)
+
+    if (result.status === 'error') {
+      setNotice({
+        tone: 'error',
+        text: `Could not save the version. ${result.error?.message ?? ''}`.trim(),
+      })
+      return // keep the note so you can try again
+    }
+
+    setNotice(
+      result.status === 'unchanged'
+        ? { tone: 'info', text: 'No changes since the last version.' }
+        : { tone: 'ok', text: 'Version saved.' },
+    )
     setLabel('')
   }
 
-  function handleRestore() {
+  async function handleRestore() {
     if (!selected) {
       return
     }
     const confirmed = window.confirm(
       `Restore the version from ${formatDate(selected.createdAt)}? Your current text is saved as a version first.`,
     )
-    if (confirmed) {
-      void onRestore(selected)
+    if (!confirmed) {
+      return
     }
+
+    const restored = await onRestore(selected)
+    setNotice(
+      restored
+        ? { tone: 'ok', text: 'Version restored.' }
+        : { tone: 'error', text: 'Restore failed. Your document was not changed.' },
+    )
   }
 
   function handleDelete() {
@@ -86,7 +106,14 @@ export function HistoryPanel({
           Save version
         </button>
       </form>
-      {notice ? <p className="history__notice">{notice}</p> : null}
+      {notice ? (
+        <p
+          className={`history__notice history__notice--${notice.tone}`}
+          role={notice.tone === 'error' ? 'alert' : 'status'}
+        >
+          {notice.text}
+        </p>
+      ) : null}
 
       {revisions.length === 0 ? (
         <p className="history__empty">
@@ -144,7 +171,12 @@ export function HistoryPanel({
               <div className="history__preview">
                 {isIdentical ? (
                   <p className="history__empty">Identical to your current text.</p>
-                ) : view === 'changes' && diff ? (
+                ) : view === 'changes' && !diff ? (
+                  <p className="history__empty">
+                    Diff too large to calculate. Use the “Full text” tab to read
+                    this version.
+                  </p>
+                ) : view === 'changes' ? (
                   diff.map((line, index) => (
                     <div key={index} className={`diff diff--${line.type}`}>
                       <span className="diff__mark" aria-hidden="true">

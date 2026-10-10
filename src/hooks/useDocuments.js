@@ -1,8 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
-  deleteDocumentRecord,
+  deleteDocumentWithRevisions,
   deleteRevisionRecord,
-  deleteRevisionsForDocument,
   initDocumentsDb,
   listDocuments,
   listRevisions,
@@ -99,13 +98,19 @@ export function useDocuments() {
     }
   }, [])
 
-  // Like `git commit`: stores a full copy of the text. Skips if nothing changed.
+  // Like `git commit`: stores a full copy of the text.
+  // Never rejects. Resolves to { status, revision?, error? } where status is
+  // 'created' | 'promoted' | 'unchanged' | 'error', so callers can tell
+  // "nothing to save" apart from "storage failed".
   const createSnapshot = useCallback(
-    (document, { kind = 'auto', label = '', minIntervalMs = 0 } = {}) => {
+    (
+      document,
+      { kind = 'auto', label = '', minIntervalMs = 0, allowEmpty = false } = {},
+    ) => {
       const task = snapshotChainRef.current
         .then(async () => {
-          if (!document.content.trim()) {
-            return null
+          if (!document.content && !allowEmpty) {
+            return { status: 'unchanged' }
           }
 
           const existing = await listRevisions(document.id)
@@ -114,12 +119,16 @@ export function useDocuments() {
           if (latest && latest.content === document.content) {
             // Same text as the newest version: just promote it to a named one.
             if (kind === 'manual' && latest.kind === 'auto') {
-              const promoted = { ...latest, kind: 'manual', label }
+              const promoted = {
+                ...latest,
+                kind: 'manual',
+                label: label || latest.label,
+              }
               await putRevision(promoted)
               await refreshRevisions(document.id)
-              return promoted
+              return { status: 'promoted', revision: promoted }
             }
-            return null
+            return { status: 'unchanged' }
           }
 
           if (
@@ -127,7 +136,7 @@ export function useDocuments() {
             latest &&
             Date.now() - latest.createdAt < minIntervalMs
           ) {
-            return null
+            return { status: 'unchanged' }
           }
 
           const revision = {
@@ -139,11 +148,16 @@ export function useDocuments() {
             createdAt: Date.now(),
           }
           await putRevision(revision)
-          await pruneRevisions(document.id, MAX_REVISIONS)
+
+          try {
+            await pruneRevisions(document.id, MAX_REVISIONS)
+          } catch {
+            // The version is saved; failing to trim old ones is not fatal.
+          }
           await refreshRevisions(document.id)
-          return revision
+          return { status: 'created', revision }
         })
-        .catch(() => null)
+        .catch((error) => ({ status: 'error', error }))
 
       snapshotChainRef.current = task
       return task
@@ -181,6 +195,7 @@ export function useDocuments() {
           void createSnapshot(latest, {
             kind: 'auto',
             minIntervalMs: AUTO_SNAPSHOT_INTERVAL_MS,
+            allowEmpty: true,
           })
         } catch (error) {
           if (selectedIdRef.current === latest.id) {
@@ -324,6 +339,7 @@ export function useDocuments() {
           void createSnapshot(current, {
             kind: 'auto',
             label: 'Before this editing session',
+            allowEmpty: true,
           })
         }
       }
@@ -340,8 +356,7 @@ export function useDocuments() {
       await snapshotChainRef.current
 
       try {
-        await deleteDocumentRecord(id)
-        await deleteRevisionsForDocument(id)
+        await deleteDocumentWithRevisions(id)
         sessionBaselineRef.current.delete(id)
         const remaining = documentsRef.current.filter((item) => item.id !== id)
         syncDocuments(remaining)
@@ -367,35 +382,54 @@ export function useDocuments() {
     [clearSaveTimer, syncDocuments],
   )
 
-  // Manual "commit". Returns the version, or null if nothing changed.
+  // Manual "commit". Resolves to the same { status, revision?, error? } shape
+  // as createSnapshot so the UI can tell "unchanged" from "failed".
   const saveVersion = useCallback(
     async (label = '') => {
       const id = selectedIdRef.current
-      if (!id) {
-        return null
+      if (!documentsRef.current.some((item) => item.id === id)) {
+        return { status: 'error', error: new Error('No document is selected.') }
       }
       await flushSave(id)
       const document = documentsRef.current.find((item) => item.id === id)
       if (!document) {
-        return null
+        return { status: 'error', error: new Error('The document no longer exists.') }
       }
-      return createSnapshot(document, { kind: 'manual', label: label.trim() })
+      return createSnapshot(document, {
+        kind: 'manual',
+        label: label.trim(),
+        allowEmpty: true,
+      })
     },
     [createSnapshot, flushSave],
   )
 
   // Like `git checkout <version>`, but your current text is snapshotted first.
+  // If that safety snapshot fails, the restore is cancelled so nothing is lost.
+  // Resolves to true when the restore happened.
   const restoreRevision = useCallback(
     async (revision) => {
       const id = selectedIdRef.current
       const document = documentsRef.current.find((item) => item.id === id)
       if (!document || revision.documentId !== id) {
-        return
+        return false
       }
 
-      await createSnapshot(document, { kind: 'auto', label: 'Before restore' })
+      const backup = await createSnapshot(document, {
+        kind: 'auto',
+        label: 'Before restore',
+        allowEmpty: true,
+      })
+      if (backup.status === 'error') {
+        setErrorMessage(
+          `Restore cancelled: could not back up your current text. ${backup.error.message}`,
+        )
+        return false
+      }
+
       updateDocument(id, { content: revision.content }, { persistImmediately: true })
       await refreshRevisions(id)
+      return true
     },
     [createSnapshot, refreshRevisions, updateDocument],
   )

@@ -167,3 +167,11 @@
   align-items: center;
   gap: 12px;
 }
+
+.history__notice--error {
+  color: var(--error);
+}
+
+.history__notice--ok {
+  color: var(--saved);
+}
