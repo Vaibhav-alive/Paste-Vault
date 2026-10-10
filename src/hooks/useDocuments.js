@@ -351,7 +351,13 @@ export function useDocuments() {
 
   const deleteDocument = useCallback(
     async (id) => {
-      clearSaveTimer()
+      if (id === selectedIdRef.current) {
+        // Deleting the open document: its pending save no longer matters.
+        clearSaveTimer()
+      } else {
+        // Deleting a different document: don't lose the open one's pending edits.
+        await flushSave()
+      }
       await writeChainRef.current
       await snapshotChainRef.current
 
@@ -379,7 +385,7 @@ export function useDocuments() {
         return false
       }
     },
-    [clearSaveTimer, syncDocuments],
+    [clearSaveTimer, flushSave, syncDocuments],
   )
 
   // Manual "commit". Resolves to the same { status, revision?, error? } shape
