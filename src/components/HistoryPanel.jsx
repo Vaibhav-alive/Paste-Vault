@@ -19,6 +19,8 @@ function wordCount(text) {
 
 export function HistoryPanel({
   revisions,
+  historyError,
+  onReload,
   currentContent,
   onSaveVersion,
   onRestore,
@@ -70,12 +72,17 @@ export function HistoryPanel({
       return
     }
 
-    const restored = await onRestore(selected)
-    setNotice(
-      restored
-        ? { tone: 'ok', text: 'Version restored.' }
-        : { tone: 'error', text: 'Restore failed. Your document was not changed.' },
-    )
+    const outcome = await onRestore(selected)
+    if (outcome === 'restored') {
+      setNotice({ tone: 'ok', text: 'Version restored.' })
+    } else if (outcome === 'unsaved') {
+      setNotice({
+        tone: 'error',
+        text: 'Restored on screen, but saving to this browser failed. Copy your text somewhere safe; editing again will retry the save.',
+      })
+    } else {
+      setNotice({ tone: 'error', text: 'Restore cancelled. Your document was not changed.' })
+    }
   }
 
   function handleDelete() {
@@ -115,7 +122,16 @@ export function HistoryPanel({
         </p>
       ) : null}
 
-      {revisions.length === 0 ? (
+      {historyError ? (
+        <div className="history__error" role="alert">
+          <p>Could not load version history. {historyError}</p>
+          <button type="button" className="button" onClick={onReload}>
+            Retry
+          </button>
+        </div>
+      ) : null}
+
+      {revisions.length === 0 && !historyError ? (
         <p className="history__empty">
           No versions yet. One is created automatically the first time you edit
           a document each session, and about every 10 minutes while you write.

@@ -13,6 +13,8 @@ function App() {
     selectedDocument,
     saveStatus,
     revisions,
+    historyError,
+    reloadHistory,
     createDocument,
     selectDocument,
     renameDocument,
@@ -90,6 +92,8 @@ function App() {
             onContentChange={updateContent}
             disabled={persistenceDisabled}
             revisions={revisions}
+            historyError={historyError}
+            onReloadHistory={reloadHistory}
             onSaveVersion={saveVersion}
             onRestoreRevision={restoreRevision}
             onDeleteRevision={deleteRevision}

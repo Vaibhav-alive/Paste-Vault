@@ -8,6 +8,8 @@ export function Editor({
   onContentChange,
   disabled,
   revisions,
+  historyError,
+  onReloadHistory,
   onSaveVersion,
   onRestoreRevision,
   onDeleteRevision,
@@ -40,7 +42,7 @@ export function Editor({
             onClick={() => setHistoryOpen((open) => !open)}
             disabled={disabled}
           >
-            History ({revisions.length})
+            History ({historyError ? '!' : revisions.length})
           </button>
           <SaveIndicator saveStatus={saveStatus} />
         </div>
@@ -63,6 +65,8 @@ export function Editor({
         <HistoryPanel
           key={document.id}
           revisions={revisions}
+          historyError={historyError}
+          onReload={onReloadHistory}
           currentContent={document.content}
           onSaveVersion={onSaveVersion}
           onRestore={onRestoreRevision}

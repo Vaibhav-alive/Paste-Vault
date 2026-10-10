@@ -57,6 +57,7 @@ export function useDocuments() {
   const [selectedId, setSelectedId] = useState(null)
   const [saveStatus, setSaveStatus] = useState('idle')
   const [revisions, setRevisions] = useState([])
+  const [historyError, setHistoryError] = useState('')
 
   const documentsRef = useRef([])
   const selectedIdRef = useRef(null)
@@ -65,7 +66,10 @@ export function useDocuments() {
   const saveTimerRef = useRef(null)
   const writeChainRef = useRef(Promise.resolve())
   const snapshotChainRef = useRef(Promise.resolve())
-  const sessionBaselineRef = useRef(new Set())
+  // First-edit baseline tracking (per document, per session):
+  const baselineDoneRef = useRef(new Set()) // snapshot succeeded
+  const baselineInFlightRef = useRef(new Set()) // attempt running right now
+  const baselineOriginalRef = useRef(new Map()) // pre-edit doc, kept for retries
 
   const syncDocuments = useCallback((nextDocuments) => {
     const sorted = sortDocuments(nextDocuments)
@@ -86,15 +90,20 @@ export function useDocuments() {
   const refreshRevisions = useCallback(async (id) => {
     if (!id) {
       setRevisions([])
+      setHistoryError('')
       return
     }
     try {
       const list = await listRevisions(id)
       if (selectedIdRef.current === id) {
         setRevisions(list)
+        setHistoryError('')
       }
-    } catch {
-      // History is a bonus; never break editing because of it.
+    } catch (error) {
+      // Editing keeps working, but the UI must not pretend history is empty.
+      if (selectedIdRef.current === id) {
+        setHistoryError(error.message)
+      }
     }
   }, [])
 
@@ -123,6 +132,7 @@ export function useDocuments() {
                 ...latest,
                 kind: 'manual',
                 label: label || latest.label,
+                createdAt: Date.now(),
               }
               await putRevision(promoted)
               await refreshRevisions(document.id)
@@ -169,12 +179,12 @@ export function useDocuments() {
     (document, revision) => {
       const write = writeChainRef.current.then(async () => {
         if (revision !== pendingRevisionRef.current) {
-          return
+          return 'superseded'
         }
 
         const latest = documentsRef.current.find((item) => item.id === document.id)
         if (!latest) {
-          return
+          return 'failed'
         }
 
         setSaveStatus('saving')
@@ -197,11 +207,13 @@ export function useDocuments() {
             minIntervalMs: AUTO_SNAPSHOT_INTERVAL_MS,
             allowEmpty: true,
           })
+          return 'saved'
         } catch (error) {
           if (selectedIdRef.current === latest.id) {
             setSaveStatus('error')
             setErrorMessage(error.message)
           }
+          return 'failed'
         }
       })
 
@@ -247,11 +259,14 @@ export function useDocuments() {
     [clearSaveTimer, persistDocument],
   )
 
+  // Returns { document, persisted }. `persisted` resolves to 'saved', 'failed',
+  // 'superseded' (a newer edit replaced this write) or 'pending' (debounced
+  // save scheduled, not written yet).
   const updateDocument = useCallback(
     (id, patch, { persistImmediately = false } = {}) => {
       const current = documentsRef.current.find((item) => item.id === id)
       if (!current) {
-        return null
+        return { document: null, persisted: Promise.resolve('failed') }
       }
 
       const nextDocument = {
@@ -264,15 +279,16 @@ export function useDocuments() {
         documentsRef.current.map((item) => (item.id === id ? nextDocument : item)),
       )
 
+      let persisted = Promise.resolve('pending')
       if (persistImmediately) {
         clearSaveTimer()
         pendingRevisionRef.current += 1
-        void persistDocument(nextDocument, pendingRevisionRef.current)
+        persisted = persistDocument(nextDocument, pendingRevisionRef.current)
       } else {
         scheduleSave(nextDocument)
       }
 
-      return nextDocument
+      return { document: nextDocument, persisted }
     },
     [clearSaveTimer, persistDocument, scheduleSave, syncDocuments],
   )
@@ -328,25 +344,49 @@ export function useDocuments() {
     [updateDocument],
   )
 
+  // Saves the pre-edit state of a document once per session. The original is
+  // remembered, so a retry after a failure still stores the pre-edit text
+  // rather than whatever has been typed since.
+  const attemptBaseline = useCallback(
+    (id) => {
+      const original = baselineOriginalRef.current.get(id)
+      if (!original || baselineInFlightRef.current.has(id)) {
+        return
+      }
+
+      baselineInFlightRef.current.add(id)
+      void createSnapshot(original, {
+        kind: 'auto',
+        label: 'Before this editing session',
+        allowEmpty: true,
+      }).then((result) => {
+        baselineInFlightRef.current.delete(id)
+        if (result.status !== 'error') {
+          baselineOriginalRef.current.delete(id)
+          baselineDoneRef.current.add(id)
+        }
+      })
+    },
+    [createSnapshot],
+  )
+
   const updateContent = useCallback(
     (id, content) => {
-      const current = documentsRef.current.find((item) => item.id === id)
-
-      // First edit of this document in this session: keep what was there before.
-      if (current && !sessionBaselineRef.current.has(id)) {
-        sessionBaselineRef.current.add(id)
-        if (current.content !== content) {
-          void createSnapshot(current, {
-            kind: 'auto',
-            label: 'Before this editing session',
-            allowEmpty: true,
-          })
+      if (!baselineDoneRef.current.has(id)) {
+        const current = documentsRef.current.find((item) => item.id === id)
+        if (
+          current &&
+          !baselineOriginalRef.current.has(id) &&
+          current.content !== content
+        ) {
+          baselineOriginalRef.current.set(id, current)
         }
+        attemptBaseline(id)
       }
 
       updateDocument(id, { content })
     },
-    [createSnapshot, updateDocument],
+    [attemptBaseline, updateDocument],
   )
 
   const deleteDocument = useCallback(
@@ -363,7 +403,9 @@ export function useDocuments() {
 
       try {
         await deleteDocumentWithRevisions(id)
-        sessionBaselineRef.current.delete(id)
+        baselineDoneRef.current.delete(id)
+        baselineInFlightRef.current.delete(id)
+        baselineOriginalRef.current.delete(id)
         const remaining = documentsRef.current.filter((item) => item.id !== id)
         syncDocuments(remaining)
 
@@ -411,14 +453,16 @@ export function useDocuments() {
   )
 
   // Like `git checkout <version>`, but your current text is snapshotted first.
-  // If that safety snapshot fails, the restore is cancelled so nothing is lost.
-  // Resolves to true when the restore happened.
+  // Resolves to:
+  //   'restored'  - restored text was written to IndexedDB
+  //   'unsaved'   - restored on screen, but the write failed
+  //   'cancelled' - nothing changed (e.g. the safety backup failed)
   const restoreRevision = useCallback(
     async (revision) => {
       const id = selectedIdRef.current
       const document = documentsRef.current.find((item) => item.id === id)
       if (!document || revision.documentId !== id) {
-        return false
+        return 'cancelled'
       }
 
       const backup = await createSnapshot(document, {
@@ -430,12 +474,17 @@ export function useDocuments() {
         setErrorMessage(
           `Restore cancelled: could not back up your current text. ${backup.error.message}`,
         )
-        return false
+        return 'cancelled'
       }
 
-      updateDocument(id, { content: revision.content }, { persistImmediately: true })
+      const { persisted } = updateDocument(
+        id,
+        { content: revision.content },
+        { persistImmediately: true },
+      )
+      const outcome = await persisted
       await refreshRevisions(id)
-      return true
+      return outcome === 'failed' ? 'unsaved' : 'restored'
     },
     [createSnapshot, refreshRevisions, updateDocument],
   )
@@ -452,8 +501,16 @@ export function useDocuments() {
     [refreshRevisions],
   )
 
+  const reloadHistory = useCallback(
+    () => refreshRevisions(selectedIdRef.current),
+    [refreshRevisions],
+  )
+
   useEffect(() => {
-    refreshRevisions(selectedId)
+    // Don't show the previous document's versions if this load fails.
+    setRevisions([])
+    setHistoryError('')
+    void refreshRevisions(selectedId)
   }, [selectedId, refreshRevisions])
 
   useEffect(() => {
@@ -526,6 +583,8 @@ export function useDocuments() {
     selectedDocument,
     saveStatus,
     revisions,
+    historyError,
+    reloadHistory,
     createDocument,
     selectDocument,
     renameDocument,
